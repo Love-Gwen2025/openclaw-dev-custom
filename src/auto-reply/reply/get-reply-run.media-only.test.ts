@@ -215,6 +215,35 @@ function ownerParams(): Parameters<typeof runPreparedReply>[0] {
   return params;
 }
 
+function deepSeekRoleplayParams(
+  overrides: Partial<Parameters<typeof runPreparedReply>[0]> = {},
+): Parameters<typeof runPreparedReply>[0] {
+  return baseParams({
+    agentId: "main",
+    provider: "deepseek",
+    model: "deepseek-v4-pro",
+    ctx: {
+      Body: "你在吗？",
+      RawBody: "你在吗？",
+      CommandBody: "你在吗？",
+    },
+    sessionCtx: {
+      Body: "你在吗？",
+      BodyStripped: "你在吗？",
+      Provider: "slack",
+    },
+    ...overrides,
+  });
+}
+
+function normalizedCommand(body: string): Parameters<typeof runPreparedReply>[0]["command"] {
+  return {
+    ...(baseParams().command as Record<string, unknown>),
+    commandBodyNormalized: body,
+    rawBodyNormalized: body,
+  } as never;
+}
+
 describe("runPreparedReply media-only handling", () => {
   beforeAll(async () => {
     ({ runPreparedReply } = await import("./get-reply-run.js"));
@@ -554,6 +583,71 @@ describe("runPreparedReply media-only handling", () => {
     expect(call?.followupRun.prompt).toContain("re-read persona files");
     expect(call?.replyThreadingOverride).toEqual({ implicitCurrentMessage: "deny" });
   });
+
+  it.each(["deepseek-v4-pro", "deepseek-v4-flash"])(
+    "appends the DeepSeek V4 roleplay marker on the first main turn for %s",
+    async (model) => {
+      await runPreparedReply(deepSeekRoleplayParams({ model }));
+
+      const call = vi.mocked(runReplyAgent).mock.calls[0]?.[0];
+      expect(call).toBeTruthy();
+      expect(call?.commandBody).toContain("你在吗？");
+      expect(call?.commandBody).toContain("【角色沉浸要求】");
+      expect(call?.commandBody).toContain("最终输出只保留角色对用户说的话");
+      expect(call?.followupRun.prompt).toContain("【角色沉浸要求】");
+      expect((call?.commandBody ?? "").indexOf("你在吗？")).toBeLessThan(
+        (call?.commandBody ?? "").indexOf("【角色沉浸要求】"),
+      );
+    },
+  );
+
+  it.each([
+    { name: "non-main agent", overrides: { agentId: "ops" } },
+    {
+      name: "non-DeepSeek provider",
+      overrides: { provider: "anthropic", model: "claude-opus-4-1" },
+    },
+    { name: "non-V4 DeepSeek model", overrides: { model: "deepseek-chat" } },
+    { name: "heartbeat", overrides: { opts: { isHeartbeat: true } as never } },
+    { name: "non-first turn", overrides: { isNewSession: false, systemSent: true } },
+  ] satisfies Array<{
+    name: string;
+    overrides: Partial<Parameters<typeof runPreparedReply>[0]>;
+  }>)("does not append the DeepSeek V4 roleplay marker for $name", async ({ overrides }) => {
+    await runPreparedReply(deepSeekRoleplayParams(overrides));
+
+    const call = vi.mocked(runReplyAgent).mock.calls[0]?.[0];
+    expect(call).toBeTruthy();
+    expect(call?.commandBody).not.toContain("【角色沉浸要求】");
+    expect(call?.followupRun.prompt).not.toContain("【角色沉浸要求】");
+  });
+
+  it.each(["/new", "/reset"])(
+    "does not append the DeepSeek V4 roleplay marker to bare %s bootstrap turns",
+    async (body) => {
+      await runPreparedReply(
+        deepSeekRoleplayParams({
+          ctx: {
+            Body: body,
+            RawBody: body,
+            CommandBody: body,
+          },
+          sessionCtx: {
+            Body: "",
+            BodyStripped: "",
+            Provider: "slack",
+          },
+          command: normalizedCommand(body),
+          resetTriggered: true,
+        }),
+      );
+
+      const call = vi.mocked(runReplyAgent).mock.calls[0]?.[0];
+      expect(call).toBeTruthy();
+      expect(call?.commandBody).not.toContain("【角色沉浸要求】");
+      expect(call?.followupRun.prompt).not.toContain("【角色沉浸要求】");
+    },
+  );
 
   it("does not emit a reset notice when /new is attempted during gateway drain", async () => {
     vi.mocked(runReplyAgent).mockRejectedValueOnce(createGatewayDrainingError());

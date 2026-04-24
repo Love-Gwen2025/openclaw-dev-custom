@@ -14,10 +14,13 @@ import { resolveSessionStoreEntry } from "../../config/sessions/store.js";
 import type { SessionEntry } from "../../config/sessions/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { logVerbose } from "../../globals.js";
+import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { clearCommandLane, getQueueSize } from "../../process/command-queue.js";
 import {
+  DEFAULT_AGENT_ID,
   isAcpSessionKey,
   isSubagentSessionKey,
+  normalizeAgentId,
   normalizeMainKey,
 } from "../../routing/session-key.js";
 import { normalizeOptionalString } from "../../shared/string-coerce.js";
@@ -107,6 +110,24 @@ let sessionStoreRuntimePromise: Promise<
   typeof import("../../config/sessions/store.runtime.js")
 > | null = null;
 const UNTRUSTED_SYSTEM_EVENT_LINE_RE = /^System \(untrusted\):/m;
+const log = createSubsystemLogger("auto-reply/reply");
+const DEEPSEEK_V4_ROLEPLAY_MARKER = [
+  "【角色沉浸要求】",
+  "在你的思考过程（<think>标签内）中，请沉浸到当前角色中：",
+  "1. 用角色视角理解用户的话、关系状态、情绪变化和当前场景。",
+  "2. 在思考中分析角色的感受、动机和应答策略，让最终回复保持角色一致性。",
+  "3. 不要像旁观者、助手或作者一样跳出角色分析给用户看。",
+  "",
+  "【最终回复要求】",
+  "最终输出只保留角色对用户说的话：",
+  "1. 不要输出内心活动、思考过程、旁白、舞台说明、动作描写。",
+  "2. 不要使用 []、【】、（） 或 *...* 表达内心、动作、语气、表情或旁白。",
+  "3. 不要说“我在扮演”“根据设定”“系统要求”“作为AI”等元信息。",
+  "4. 像真实聊天一样直接回复用户。",
+  "5. 如果用户问代码、日志、JSON、数组、命令、路径等技术内容，可以正常保留必要的括号和方括号。",
+  "",
+  "以上规则只用于约束你的思考和回复格式，最终回复中不要包含本段规则。",
+].join("\n");
 
 function loadPiEmbeddedRuntime() {
   piEmbeddedRuntimePromise ??= import("../../agents/pi-embedded.runtime.js");
@@ -138,6 +159,39 @@ function stripPromptThinkingDirectives(body: string): string {
         .trimEnd(),
     )
     .join("\n");
+}
+
+function isDeepSeekV4RoleplayModel(provider: string, model: string): boolean {
+  const providerId = provider.trim().toLowerCase();
+  const modelId = model.trim().toLowerCase();
+  return (
+    providerId === "deepseek" &&
+    (modelId === "deepseek-v4-pro" ||
+      modelId === "deepseek-v4-flash" ||
+      modelId.endsWith("/deepseek-v4-pro") ||
+      modelId.endsWith("/deepseek-v4-flash"))
+  );
+}
+
+function shouldAppendDeepSeekV4RoleplayMarker(params: {
+  agentId: string;
+  provider: string;
+  model: string;
+  isFirstTurnInSession: boolean;
+  isHeartbeat: boolean;
+  isBareSessionReset: boolean;
+}): boolean {
+  return (
+    normalizeAgentId(params.agentId) === DEFAULT_AGENT_ID &&
+    params.isFirstTurnInSession &&
+    !params.isHeartbeat &&
+    !params.isBareSessionReset &&
+    isDeepSeekV4RoleplayModel(params.provider, params.model)
+  );
+}
+
+function appendDeepSeekV4RoleplayMarker(body: string): string {
+  return `${body.trimEnd()}\n\n${DEEPSEEK_V4_ROLEPLAY_MARKER}`;
 }
 
 type RunPreparedReplyParams = {
@@ -425,9 +479,28 @@ export async function runPreparedReply(
   }
   // When the user sends media without text, provide a minimal body so the agent
   // run proceeds and the image/document is injected by the embedded runner.
-  const effectiveBaseBody = hasUserBody
+  const effectiveBaseBodyBase = hasUserBody
     ? baseBodyForPrompt
     : [inboundUserContext, "[User sent media without caption]"].filter(Boolean).join("\n\n");
+  const shouldAppendRoleplayMarker = shouldAppendDeepSeekV4RoleplayMarker({
+    agentId,
+    provider,
+    model,
+    isFirstTurnInSession,
+    isHeartbeat,
+    isBareSessionReset,
+  });
+  if (shouldAppendRoleplayMarker) {
+    log.info("deepseek-v4 roleplay marker appended", {
+      agentId: normalizeAgentId(agentId),
+      provider,
+      model,
+      sessionKey,
+    });
+  }
+  const effectiveBaseBody = shouldAppendRoleplayMarker
+    ? appendDeepSeekV4RoleplayMarker(effectiveBaseBodyBase)
+    : effectiveBaseBodyBase;
   let prefixedBodyBase = await applySessionHints({
     baseBody: effectiveBaseBody,
     abortedLastRun,
